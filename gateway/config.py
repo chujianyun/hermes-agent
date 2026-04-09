@@ -666,6 +666,7 @@ def load_gateway_config() -> GatewayConfig:
         Platform.SLACK: "SLACK_BOT_TOKEN",
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
+        Platform.QQ: "QQ_APP_ID",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
