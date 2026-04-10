@@ -1,18 +1,30 @@
 """
 Hermes QQ Bot Platform Adapter
 
-Fully aligned with Hermes gateway specification + Tencent QQ Bot official implementation.
+Fully aligned with Hermes gateway specification + Tencent OpenClaw QQ Bot official implementation.
 QQ Open Platform documentation: https://q.qq.com/wiki/
+
+This adapter should be placed in:
+  ~/.hermes/plugins/hermes-qqbot/qqbot/adapter.py
+
+Or integrated into core with 2 minimal modifications:
+  1. gateway/config.py - Add Platform.QQ = "qq"
+  2. gateway/run.py   - Add QQ adapter registration in _create_adapter()
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
+
+import sys
+import os
 
 try:
     import aiohttp
@@ -27,6 +39,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_url,
     get_image_cache_dir,
     get_audio_cache_dir,
 )
@@ -73,6 +89,47 @@ class QQBotConfig:
     markdown_support: bool = False
 
 
+class RefIndexStore:
+    """In-memory store for message reference index (ref_idx)."""
+    
+    def __init__(self):
+        self._store: Dict[str, Dict[str, Any]] = {}
+    
+    def set(self, ref_idx: str, entry: Dict[str, Any]) -> None:
+        self._store[ref_idx] = entry
+    
+    def get(self, ref_idx: str) -> Optional[Dict[str, Any]]:
+        return self._store.get(ref_idx)
+    
+    def clear(self) -> None:
+        self._store.clear()
+
+
+class MessageQueue:
+    """Per-user concurrent message queue."""
+    
+    def __init__(self, account_id: str, log: Optional[logging.Logger] = None):
+        self.account_id = account_id
+        self.log = log
+        self._queues: Dict[str, List[Dict[str, Any]]] = {}
+    
+    def enqueue(self, msg: Dict[str, Any]) -> None:
+        peer_id = msg.get("peer_id", msg.get("sender_id", "unknown"))
+        if peer_id not in self._queues:
+            self._queues[peer_id] = []
+        self._queues[peer_id].append(msg)
+    
+    def get_next(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        if peer_id in self._queues and self._queues[peer_id]:
+            return self._queues[peer_id].pop(0)
+        return None
+    
+    def clear_user_queue(self, peer_id: str) -> int:
+        count = len(self._queues.get(peer_id, []))
+        if peer_id in self._queues:
+            self._queues[peer_id] = []
+        return count
+
 
 class QQAdapter(BasePlatformAdapter):
     """
@@ -117,6 +174,8 @@ class QQAdapter(BasePlatformAdapter):
         self._reconnect_attempts: int = 0
         self._session_id: Optional[str] = None
         self._last_seq: Optional[int] = None
+        self._ref_index: RefIndexStore = RefIndexStore()
+        self._msg_queue: MessageQueue = MessageQueue(self.name, logger)
         self._image_cache_dir = get_image_cache_dir()
         self._audio_cache_dir = get_audio_cache_dir()
     
@@ -318,6 +377,7 @@ class QQAdapter(BasePlatformAdapter):
                 timestamp = int(ts_raw)
             except ValueError:
                 try:
+                    from datetime import datetime
                     dt = datetime.strptime(ts_raw.replace('+08:00', '+0000'), "%Y-%m-%dT%H:%M:%S%z")
                     timestamp = int(dt.timestamp() * 1000)
                 except ValueError:
@@ -383,6 +443,7 @@ class QQAdapter(BasePlatformAdapter):
                 timestamp = int(ts_raw)
             except ValueError:
                 try:
+                    from datetime import datetime
                     dt = datetime.strptime(ts_raw.replace('+08:00', '+0000'), "%Y-%m-%dT%H:%M:%S%z")
                     timestamp = int(dt.timestamp() * 1000)
                 except ValueError:
@@ -734,3 +795,528 @@ class QQAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Format message for QQ platform."""
         return content
+
+    # ======================================================================
+    # Media file sending via QQ chunked upload API
+    # ======================================================================
+
+    # QQ MediaFileType enum values
+    _MEDIA_FILE_TYPE_IMAGE = 1
+    _MEDIA_FILE_TYPE_VIDEO = 2
+    _MEDIA_FILE_TYPE_VOICE = 3
+    _MEDIA_FILE_TYPE_FILE = 4
+
+    # Chunked upload constants (aligned with OpenClaw implementation)
+    _DEFAULT_CONCURRENT_PARTS = 1
+    _MAX_CONCURRENT_PARTS = 10
+    _MAX_PART_FINISH_RETRY_TIMEOUT_S = 600  # 10 minutes
+    _PART_UPLOAD_TIMEOUT_S = 300  # 5 minutes per part
+    _PART_UPLOAD_MAX_RETRIES = 2
+    _COMPLETE_UPLOAD_MAX_RETRIES = 2
+    _COMPLETE_UPLOAD_BASE_DELAY_S = 2.0
+    _PART_FINISH_MAX_RETRIES = 2
+    _PART_FINISH_BASE_DELAY_S = 1.0
+    _PART_FINISH_RETRYABLE_CODES = {40093001}
+    _UPLOAD_PREPARE_FALLBACK_CODE = 40093002
+    _PART_FINISH_RETRYABLE_DEFAULT_TIMEOUT_S = 120  # 2 minutes
+
+    # File hash: first 10002432 bytes for md5_10m (aligned with QQ protocol)
+    _MD5_10M_SIZE = 10002432
+
+    async def _compute_file_hashes(self, file_path: str) -> Dict[str, str]:
+        """
+        Stream-compute MD5, SHA1, and MD5_10M (first 10002432 bytes) in a single pass.
+        Returns dict with keys: md5, sha1, md5_10m
+        """
+        md5_h = hashlib.md5()
+        sha1_h = hashlib.sha1()
+        md5_10m_h = hashlib.md5()
+
+        file_size = Path(file_path).stat().st_size
+        need_10m = file_size > self._MD5_10M_SIZE
+        bytes_read = 0
+
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                md5_h.update(chunk)
+                sha1_h.update(chunk)
+
+                if need_10m:
+                    remaining = self._MD5_10M_SIZE - bytes_read
+                    if remaining > 0:
+                        md5_10m_h.update(chunk if len(chunk) <= remaining else chunk[:remaining])
+
+                bytes_read += len(chunk)
+
+        md5 = md5_h.hexdigest()
+        md5_10m = md5_10m_h.hexdigest() if need_10m else md5
+
+        return {
+            "md5": md5,
+            "sha1": sha1_h.hexdigest(),
+            "md5_10m": md5_10m,
+        }
+
+    def _classify_file_type(self, file_path: str) -> int:
+        """Classify file type based on extension. Returns QQ MediaFileType value."""
+        ext = Path(file_path).suffix.lower()
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            return self._MEDIA_FILE_TYPE_IMAGE
+        if ext in (".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"):
+            return self._MEDIA_FILE_TYPE_VIDEO
+        if ext in (".silk", ".ogg", ".mp3", ".wav", ".amr", ".aac", ".m4a"):
+            return self._MEDIA_FILE_TYPE_VOICE
+        return self._MEDIA_FILE_TYPE_FILE
+
+    async def _put_to_presigned_url(self, url: str, data: bytes) -> None:
+        """PUT chunk data to a COS presigned URL with retry and timeout."""
+        last_error = None
+        for attempt in range(self._PART_UPLOAD_MAX_RETRIES + 1):
+            try:
+                async with self._session.put(
+                    url,
+                    data=data,
+                    headers={"Content-Length": str(len(data))},
+                    timeout=aiohttp.ClientTimeout(total=self._PART_UPLOAD_TIMEOUT_S),
+                ) as resp:
+                    if resp.status == 200:
+                        return
+                    body = await resp.text()
+                    raise Exception(f"COS PUT failed: {resp.status} {resp.status} - {body}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt < self._PART_UPLOAD_MAX_RETRIES:
+                    delay = 1.0 * (2 ** attempt)
+                    logger.warning(f"[chunked-upload] Part upload attempt {attempt + 1} failed: {e}, retrying in {delay}s")
+                    await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore
+
+    async def _api_post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST to QQ API and return JSON response. Raises on non-200."""
+        url = f"{QQ_API_BASE}{path}"
+        async with self._session.post(
+            url,
+            headers=self._auth_headers,
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            error_text = await resp.text()
+            raise Exception(f"QQ API {resp.status} on {path}: {error_text}")
+
+    async def _part_finish_with_retry(
+        self,
+        path: str,
+        body: Dict[str, Any],
+        retry_timeout_s: Optional[float] = None,
+    ) -> None:
+        """
+        Call upload_part_finish with retry strategy:
+        - Retryable biz code (40093001): persistent retry at 1s interval until timeout
+        - Other errors: up to PART_FINISH_MAX_RETRIES with exponential backoff
+        """
+        max_attempts = self._PART_FINISH_MAX_RETRIES + 1
+        for attempt in range(max_attempts):
+            try:
+                await self._api_post(path, body)
+                return
+            except Exception as e:
+                err_msg = str(e)
+                biz_code = self._extract_biz_code(err_msg)
+
+                if biz_code in self._PART_FINISH_RETRYABLE_CODES:
+                    timeout_s = retry_timeout_s if retry_timeout_s is not None else self._PART_FINISH_RETRYABLE_DEFAULT_TIMEOUT_S
+                    timeout_s = min(timeout_s, self._MAX_PART_FINISH_RETRY_TIMEOUT_S)
+                    logger.warning(f"[chunked-upload] PartFinish hit retryable bizCode={biz_code}, entering persistent retry (timeout={timeout_s}s)")
+                    await self._part_finish_persistent_retry(path, body, timeout_s)
+                    return
+
+                if attempt < max_attempts - 1:
+                    delay = self._PART_FINISH_BASE_DELAY_S * (2 ** attempt)
+                    logger.warning(f"[chunked-upload] PartFinish attempt {attempt + 1} failed: {e}, retrying in {delay}s")
+
+        raise Exception(f"PartFinish failed after {max_attempts} attempts")
+
+    async def _part_finish_persistent_retry(
+        self,
+        path: str,
+        body: Dict[str, Any],
+        timeout_s: float,
+    ) -> None:
+        """Persistent retry at 1s interval until success or timeout."""
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        last_error = None
+
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                await self._api_post(path, body)
+                logger.info(f"[chunked-upload] PartFinish persistent retry succeeded after {attempt} retries")
+                return
+            except Exception as e:
+                last_error = e
+                biz_code = self._extract_biz_code(str(e))
+                if biz_code not in self._PART_FINISH_RETRYABLE_CODES:
+                    raise  # Different error type, bail out
+
+            await asyncio.sleep(1.0)
+
+        raise Exception(f"PartFinish persistent retry timed out after {timeout_s}s: {last_error}")
+
+    @staticmethod
+    def _extract_biz_code(error_msg: str) -> Optional[int]:
+        """Try to extract a QQ biz error code from error message string."""
+        # QQ API returns {"code": NNNNN, "message": "..."} in error responses
+        import re
+        m = re.search(r'"code"\s*:\s*(\d+)', error_msg)
+        if m:
+            return int(m.group(1))
+        return None
+
+    async def _chunked_upload_media(
+        self,
+        chat_id: str,
+        file_path: str,
+        file_type: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Upload a local file via QQ chunked upload API and return file_info.
+
+        Flow:
+        1. Compute file hashes (MD5, SHA1, MD5_10M)
+        2. upload_prepare -> get upload_id + block_size + presigned URLs
+        3. Upload all parts in parallel (with concurrency control)
+        4. complete_upload -> get file_info
+
+        Returns dict with: file_uuid, file_info, ttl
+        """
+        if file_type is None:
+            file_type = self._classify_file_type(file_path)
+
+        file_stat = Path(file_path).stat()
+        file_size = file_stat.st_size
+        file_name = Path(file_path).name
+
+        parts = chat_id.split(":", 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid chat_id format: {chat_id}")
+        _, chat_type, target_id = parts
+
+        # Build API path prefix
+        if chat_type == "c2c":
+            api_prefix = f"/v2/users/{target_id}"
+        elif chat_type == "group":
+            api_prefix = f"/v2/groups/{target_id}"
+        else:
+            raise Exception(f"Unsupported chat type: {chat_type}")
+
+        # 1. Compute hashes
+        logger.info(f"[chunked-upload] Computing hashes for {file_name} ({file_size} bytes, type={file_type})")
+        hashes = await asyncio.get_event_loop().run_in_executor(None, self._compute_file_hashes_sync, file_path)
+        logger.info(f"[chunked-upload] Hashes: md5={hashes['md5'][:16]}..., sha1={hashes['sha1'][:16]}...")
+
+        # 2. upload_prepare
+        await self._refresh_access_token()
+        prepare_body = {
+            "file_type": file_type,
+            "file_name": file_name,
+            "file_size": file_size,
+            "md5": hashes["md5"],
+            "sha1": hashes["sha1"],
+            "md5_10m": hashes["md5_10m"],
+        }
+
+        try:
+            prepare_resp = await self._api_post(f"{api_prefix}/upload_prepare", prepare_body)
+        except Exception as e:
+            biz_code = self._extract_biz_code(str(e))
+            if biz_code == self._UPLOAD_PREPARE_FALLBACK_CODE:
+                raise Exception(f"Upload daily limit exceeded for {file_name} ({file_size} bytes): {e}")
+            raise
+
+        upload_id = prepare_resp["upload_id"]
+        block_size = int(prepare_resp["block_size"])
+        upload_parts = prepare_resp["parts"]  # list of {index, presigned_url}
+        concurrency = min(
+            int(prepare_resp.get("concurrency", self._DEFAULT_CONCURRENT_PARTS)),
+            self._MAX_CONCURRENT_PARTS,
+        )
+        retry_timeout_s = None
+        if "retry_timeout" in prepare_resp:
+            retry_timeout_s = min(
+                float(prepare_resp["retry_timeout"]),
+                self._MAX_PART_FINISH_RETRY_TIMEOUT_S,
+            )
+
+        logger.info(
+            f"[chunked-upload] Prepared: upload_id={upload_id}, block_size={block_size}, "
+            f"parts={len(upload_parts)}, concurrency={concurrency}"
+        )
+
+        # 3. Upload parts with concurrency control (batch mode)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def upload_one_part(part_info: Dict[str, Any]) -> None:
+            async with semaphore:
+                part_index = int(part_info["index"])  # 1-based
+                presigned_url = part_info["presigned_url"]
+
+                # Calculate offset and length for this part
+                offset = (part_index - 1) * block_size
+                length = min(block_size, file_size - offset)
+
+                # Read chunk from file
+                loop = asyncio.get_event_loop()
+                chunk_data = await loop.run_in_executor(
+                    None, self._read_file_chunk, file_path, offset, length
+                )
+
+                # Compute part MD5
+                part_md5 = hashlib.md5(chunk_data).hexdigest()
+
+                logger.info(
+                    f"[chunked-upload] Part {part_index}/{len(upload_parts)}: "
+                    f"uploading {length} bytes (offset={offset}, md5={part_md5[:16]}...)"
+                )
+
+                # PUT to COS presigned URL
+                await self._put_to_presigned_url(presigned_url, chunk_data)
+
+                # Notify platform that part is done (refresh token to avoid expiry)
+                await self._refresh_access_token()
+                await self._part_finish_with_retry(
+                    f"{api_prefix}/upload_part_finish",
+                    {
+                        "upload_id": upload_id,
+                        "part_index": part_index,
+                        "block_size": length,
+                        "md5": part_md5,
+                    },
+                    retry_timeout_s=retry_timeout_s,
+                )
+
+                logger.info(f"[chunked-upload] Part {part_index}/{len(upload_parts)}: done")
+
+        # Execute all parts (semaphore controls concurrency)
+        tasks = [upload_one_part(p) for p in upload_parts]
+        await asyncio.gather(*tasks)
+
+        logger.info(f"[chunked-upload] All {len(upload_parts)} parts uploaded, completing...")
+
+        # 4. Complete upload
+        await self._refresh_access_token()
+        complete_resp = await self._complete_upload_with_retry(
+            f"{api_prefix}/files",
+            {"upload_id": upload_id},
+        )
+
+        logger.info(f"[chunked-upload] Upload complete: file_uuid={complete_resp.get('file_uuid')}")
+        return complete_resp
+
+    def _compute_file_hashes_sync(self, file_path: str) -> Dict[str, str]:
+        """Synchronous version of hash computation (for thread pool executor)."""
+        md5_h = hashlib.md5()
+        sha1_h = hashlib.sha1()
+        md5_10m_h = hashlib.md5()
+
+        file_size = Path(file_path).stat().st_size
+        need_10m = file_size > self._MD5_10M_SIZE
+        bytes_read = 0
+
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                md5_h.update(chunk)
+                sha1_h.update(chunk)
+
+                if need_10m:
+                    remaining = self._MD5_10M_SIZE - bytes_read
+                    if remaining > 0:
+                        md5_10m_h.update(chunk if len(chunk) <= remaining else chunk[:remaining])
+
+                bytes_read += len(chunk)
+
+        md5 = md5_h.hexdigest()
+        return {
+            "md5": md5,
+            "sha1": sha1_h.hexdigest(),
+            "md5_10m": md5_10m_h.hexdigest() if need_10m else md5,
+        }
+
+    @staticmethod
+    def _read_file_chunk(file_path: str, offset: int, length: int) -> bytes:
+        """Read a specific byte range from a file."""
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            return f.read(length)
+
+    async def _complete_upload_with_retry(
+        self,
+        path: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Call complete_upload with unconditional retry on any error."""
+        last_error = None
+        for attempt in range(self._COMPLETE_UPLOAD_MAX_RETRIES + 1):
+            try:
+                return await self._api_post(path, body)
+            except Exception as e:
+                last_error = e
+                if attempt < self._COMPLETE_UPLOAD_MAX_RETRIES:
+                    delay = self._COMPLETE_UPLOAD_BASE_DELAY_S * (2 ** attempt)
+                    logger.warning(f"[chunked-upload] CompleteUpload attempt {attempt + 1} failed: {e}, retrying in {delay}s")
+                    await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore
+
+    async def _upload_and_send_media(
+        self,
+        chat_id: str,
+        file_path: str,
+        file_type: Optional[int] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """
+        Upload a local file and send it as a media message (msg_type=7).
+
+        This is the unified entry point for all media types (image, video, voice, file).
+        """
+        if not self._connected:
+            return SendResult(success=False, error="Not connected")
+
+        if not Path(file_path).exists():
+            return SendResult(success=False, error=f"File not found: {file_path}")
+
+        try:
+            # Upload file
+            upload_result = await self._chunked_upload_media(chat_id, file_path, file_type)
+            file_info = upload_result["file_info"]
+
+            # Send media message with msg_type=7
+            parts = chat_id.split(":", 2)
+            _, chat_type, target_id = parts
+
+            if chat_type == "c2c":
+                url = f"{QQ_API_BASE}/v2/users/{target_id}/messages"
+            elif chat_type == "group":
+                url = f"{QQ_API_BASE}/v2/groups/{target_id}/messages"
+            else:
+                return SendResult(success=False, error=f"Unsupported chat type: {chat_type}")
+
+            payload: Dict[str, Any] = {
+                "msg_type": 7,
+                "media": {"file_info": file_info},
+                "msg_seq": self._get_next_msg_seq(),
+            }
+            if caption:
+                payload["content"] = caption
+            if reply_to and self.bot_config.auto_quote:
+                payload["msg_id"] = reply_to
+
+            await self._refresh_access_token()
+            async with self._session.post(
+                url,
+                headers=self._auth_headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    msg_id = data.get("msg_id", data.get("id", ""))
+                    return SendResult(success=True, message_id=msg_id)
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"QQ send media failed ({resp.status}): {error_text}")
+                    return SendResult(success=False, error=f"HTTP {resp.status}: {error_text}")
+
+        except Exception as e:
+            logger.exception(f"QQ upload and send media error: {e}")
+            return SendResult(success=False, error=str(e))
+
+    # ======================================================================
+    # Override BasePlatformAdapter media sending methods
+    # ======================================================================
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file via chunked upload."""
+        return await self._upload_and_send_media(
+            chat_id=chat_id,
+            file_path=image_path,
+            file_type=self._MEDIA_FILE_TYPE_IMAGE,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio file as voice message via chunked upload."""
+        return await self._upload_and_send_media(
+            chat_id=chat_id,
+            file_path=audio_path,
+            file_type=self._MEDIA_FILE_TYPE_VOICE,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video file via chunked upload."""
+        return await self._upload_and_send_media(
+            chat_id=chat_id,
+            file_path=video_path,
+            file_type=self._MEDIA_FILE_TYPE_VIDEO,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file via chunked upload."""
+        return await self._upload_and_send_media(
+            chat_id=chat_id,
+            file_path=file_path,
+            file_type=self._MEDIA_FILE_TYPE_FILE,
+            caption=caption,
+            reply_to=reply_to,
+        )
