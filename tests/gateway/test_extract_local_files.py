@@ -269,9 +269,11 @@ class TestEdgeCases:
         assert cleaned == ""
 
     def test_no_media_extensions(self):
-        """Non-media extensions should not be matched."""
+        """Unsupported extensions should not be matched, supported docs should."""
         paths, _ = _extract("See /tmp/data.csv and /tmp/script.py and /tmp/notes.txt")
-        assert paths == []
+        assert "/tmp/script.py" not in paths
+        assert "/tmp/data.csv" in paths
+        assert "/tmp/notes.txt" in paths
 
     def test_path_with_spaces_not_matched(self):
         """Paths with spaces are intentionally not matched (avoids false positives)."""

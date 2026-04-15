@@ -256,6 +256,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    SendResult,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -5470,9 +5471,13 @@ class GatewayRunner:
         """
         from pathlib import Path
 
+        async def _send_and_check(send_coro, *, kind: str) -> None:
+            result = await send_coro
+            if isinstance(result, SendResult) and not result.success:
+                raise RuntimeError(result.error or f"unknown {kind} delivery failure")
+
         try:
-            media_files, _ = adapter.extract_media(response)
-            _, cleaned = adapter.extract_images(response)
+            media_files, cleaned = adapter.extract_media(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
             _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
@@ -5481,53 +5486,87 @@ class GatewayRunner:
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
-            for media_path, is_voice in media_files:
+            for media_path, _is_voice in media_files:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if ext in _AUDIO_EXTS:
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_voice(
+                                chat_id=event.source.chat_id,
+                                audio_path=media_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="media",
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_video(
+                                chat_id=event.source.chat_id,
+                                video_path=media_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="media",
                         )
                     elif ext in _IMAGE_EXTS:
-                        await adapter.send_image_file(
-                            chat_id=event.source.chat_id,
-                            image_path=media_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=media_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="media",
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=media_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="media",
                         )
                 except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    logger.warning("[%s] Post-stream media delivery failed for %s: %s", adapter.name, media_path, e)
+                    try:
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=f"⚠️ 文件发送失败：{Path(media_path).name}\n原因：{e}",
+                            metadata=_thread_meta,
+                        )
+                    except Exception:
+                        logger.debug("[%s] Failed to send post-stream media failure notice", adapter.name, exc_info=True)
 
             for file_path in local_files:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _IMAGE_EXTS:
-                        await adapter.send_image_file(
-                            chat_id=event.source.chat_id,
-                            image_path=file_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=file_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="file",
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
+                        await _send_and_check(
+                            adapter.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=file_path,
+                                metadata=_thread_meta,
+                            ),
+                            kind="file",
                         )
                 except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    logger.warning("[%s] Post-stream file delivery failed for %s: %s", adapter.name, file_path, e)
+                    try:
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=f"⚠️ 文件发送失败：{Path(file_path).name}\n原因：{e}",
+                            metadata=_thread_meta,
+                        )
+                    except Exception:
+                        logger.debug("[%s] Failed to send post-stream file failure notice", adapter.name, exc_info=True)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -5730,12 +5769,22 @@ class GatewayRunner:
                 # Send media files
                 for media_path in (media_files or []):
                     try:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=source.chat_id,
                             file_path=media_path,
                         )
-                    except Exception:
-                        pass
+                        if isinstance(result, SendResult) and not result.success:
+                            raise RuntimeError(result.error or "unknown background media delivery failure")
+                    except Exception as exc:
+                        logger.warning("[%s] Background media delivery failed for %s: %s", adapter.name, media_path, exc)
+                        try:
+                            await adapter.send(
+                                chat_id=source.chat_id,
+                                content=f"⚠️ 后台任务文件发送失败：{Path(media_path).name}\n原因：{exc}",
+                                metadata=_thread_metadata,
+                            )
+                        except Exception:
+                            logger.debug("[%s] Failed to send background media failure notice", adapter.name, exc_info=True)
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
